@@ -23,6 +23,45 @@
 #define NM_INO_TYPE_VIRTUAL (1 << 1)
 #define NM_INO_TYPE_DIR     (1 << 2)
 
+// --- 1. 动态符号类型定义 ---
+typedef int (*kern_path_t)(const char *name, unsigned int flags, struct path *path);
+typedef void (*mntput_t)(struct vfsmount *mnt);
+typedef struct vfsmount *(*mntget_t)(struct vfsmount *mnt);
+
+// --- 2. 全局变量 extern 声明（不要在 .h 中赋初始值）---
+extern kern_path_t fn_kern_path;
+extern mntput_t fn_mntput;
+extern mntget_t fn_mntget;
+
+// --- 3. 替换封装函数 ---
+static inline void my_path_get(const struct path *path) {
+    dget(path->dentry);
+    if (fn_mntget) fn_mntget(path->mnt);
+}
+
+static inline void my_path_put(const struct path *path) {
+    dput(path->dentry);
+    if (fn_mntput) fn_mntput(path->mnt);
+}
+
+static inline struct dentry *my_dget_parent(struct dentry *dentry) {
+    struct dentry *parent;
+    rcu_read_lock();
+    parent = dget(rcu_dereference(dentry->d_parent));
+    rcu_read_unlock();
+    return parent;
+}
+
+/* 替换原代码中的 __getname() */
+static inline char *nm_getname_buf(void) {
+    return kmalloc(PATH_MAX, GFP_ATOMIC);
+}
+
+/* 替换原代码中的 __putname() */
+static inline void nm_putname_buf(const void *buf) {
+    kfree(buf);
+}
+
 static DEFINE_HASHTABLE(nomount_rules_ht,     NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(nomount_inodes_ht,    NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(nomount_basenames_ht, NOMOUNT_HASH_BITS);

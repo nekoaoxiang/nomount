@@ -7,6 +7,15 @@
 #include <linux/version.h>
 #include "nomount.h"
 
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/kprobes.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("NoMount Project");
+MODULE_DESCRIPTION("NoMount Stealth VFS Redirection Engine LKM");
+MODULE_VERSION("1.0");
+
 static struct kmem_cache *nm_rule_cachep, *nm_dir_cachep, *nm_uid_cachep;
 atomic_t nm_active_rules = ATOMIC_INIT(0);
 atomic_t nm_active_dirs = ATOMIC_INIT(0);
@@ -128,22 +137,22 @@ static const char *nomount_build_path_from_pwd(const char *rel_name, size_t name
 
     rcu_read_lock();
     pwd = current->fs->pwd;
-    path_get(&pwd);
+    my_path_get(&pwd);
     rcu_read_unlock();
     cwd_str = d_path(&pwd, page_buf, 512);
 
     if (IS_ERR(cwd_str)) {
         if (PTR_ERR(cwd_str) == -ENAMETOOLONG) {
-            page_buf = __getname();
-            if (unlikely(!page_buf)) { path_put(&pwd); return NULL; }
+            page_buf = nm_getname_buf();
+            if (unlikely(!page_buf)) { my_path_put(&pwd); return NULL; }
             cwd_str = d_path(&pwd, page_buf, PATH_MAX);
-            if (IS_ERR(cwd_str)) { __putname(page_buf); path_put(&pwd); return NULL; }
+            if (IS_ERR(cwd_str)) { nm_putname_buf(page_buf); my_path_put(&pwd); return NULL; }
         } else {
-            path_put(&pwd);
+            my_path_put(&pwd);
             return NULL;
         }
     }
-    path_put(&pwd);
+    my_path_put(&pwd);
 
     dir_len = strlen(cwd_str);
     if (likely(dir_len + name_len + 2 <= (page_buf != fast_buf ? PATH_MAX : 512))) {
@@ -159,7 +168,7 @@ static const char *nomount_build_path_from_pwd(const char *rel_name, size_t name
         return page_buf;
     }
 
-    if (page_buf != fast_buf) __putname(page_buf);
+    if (page_buf != fast_buf) nm_putname_buf(page_buf);
     return NULL;
 }
 
@@ -354,12 +363,11 @@ struct filename *nomount_handle_getname(struct filename *name)
         ((char *)name->name)[rule->real_node.len] = '\0';
     }
     rcu_read_unlock();
-    if (page_buf && page_buf != fast_buf) __putname(page_buf);
+    if (page_buf && page_buf != fast_buf) nm_putname_buf(page_buf);
     return name;
 
 out_unlock:
     rcu_read_unlock();
-    putname(name);
     return ERR_PTR(-ENOENT);
 }
 
@@ -786,7 +794,7 @@ static int nomount_generate_virtual_topology(struct nomount_rule *rule)
         slash_r = r_tmp ? strrchr(r_tmp, '/') : NULL; 
         if (slash_r == r_tmp) slash_r = NULL;
         if (!slash_v || slash_v == v_tmp) {
-            if (likely(kern_path("/", LOOKUP_FOLLOW, &p_path) == 0)) {
+            if (likely(fn_kern_path("/", LOOKUP_FOLLOW, &p_path) == 0)) {
                 current_parent_ino = d_backing_inode(p_path.dentry)->i_ino;
                 current_parent_dev = d_backing_inode(p_path.dentry)->i_sb->s_dev;
                 child_name = v_tmp + 1;
@@ -796,7 +804,7 @@ static int nomount_generate_virtual_topology(struct nomount_rule *rule)
                 __nomount_inject_child_locked(__nomount_get_or_create_dir(current_parent_ino, current_parent_dev),
                                               t_rule, child_name, child_name_len, child_name_hash,
                                               (current_flags & NM_FLAG_IS_DIR) ? DT_DIR : DT_REG, t_rule->v_hash);
-                path_put(&p_path);
+                my_path_put(&p_path);
             }
             break;
         }
@@ -840,7 +848,7 @@ static int nomount_generate_virtual_topology(struct nomount_rule *rule)
             break;
         }
 
-        if (likely(kern_path(v_tmp, LOOKUP_FOLLOW, &p_path) == 0)) {
+        if (likely(fn_kern_path(v_tmp, LOOKUP_FOLLOW, &p_path) == 0)) {
             inherited_dev = p_path.dentry->d_sb->s_dev;
             if (p_path.dentry->d_sb->s_op->statfs) {
                 struct kstatfs st;
@@ -858,7 +866,7 @@ static int nomount_generate_virtual_topology(struct nomount_rule *rule)
             __nomount_inject_child_locked(__nomount_get_or_create_dir(current_parent_ino, current_parent_dev),
                                           t_rule, child_name, child_name_len, child_name_hash,
                                           (current_flags & NM_FLAG_IS_DIR) ? DT_DIR : DT_REG, t_rule->v_hash);
-            path_put(&p_path);
+            my_path_put(&p_path);
             break; 
         } else {
             pending_rules[p_count - 1] = kmem_cache_alloc(nm_rule_cachep, GFP_KERNEL);
@@ -901,10 +909,10 @@ static int nomount_generate_virtual_topology(struct nomount_rule *rule)
             irule->real_node.type = NM_INO_TYPE_REAL;
 
             if (slash_r) {
-                if (likely(kern_path(irule->real_path, LOOKUP_FOLLOW, &r_path_struct) == 0)) {
+                if (likely(fn_kern_path(irule->real_path, LOOKUP_FOLLOW, &r_path_struct) == 0)) {
                     irule->real_node.ino = d_backing_inode(r_path_struct.dentry)->i_ino;
                     irule->real_node.dev = r_path_struct.dentry->d_sb->s_dev;
-                    path_put(&r_path_struct);
+                    my_path_put(&r_path_struct);
                 }
             }
         }
@@ -998,16 +1006,16 @@ static int __nomount_add_rule(const char *v_path, const char *r_path, u16 v_len,
     rule->virt_node.len = v_len;
     rule->virt_node.type = NM_INO_TYPE_VIRTUAL;
 
-    if (kern_path(rule->real_path, LOOKUP_FOLLOW, &r_path_struct_main) == 0) {
+    if (fn_kern_path(rule->real_path, LOOKUP_FOLLOW, &r_path_struct_main) == 0) {
         struct inode *r_inode = d_backing_inode(r_path_struct_main.dentry);
         rule->real_node.ino = r_inode->i_ino;
         rule->real_node.dev = r_path_struct_main.dentry->d_sb->s_dev;
         if (S_ISDIR(r_inode->i_mode)) rule->flags |= NM_FLAG_IS_DIR;
         r_path_dentry = dget(r_path_struct_main.dentry);
-        path_put(&r_path_struct_main);
+        my_path_put(&r_path_struct_main);
     }
 
-    if (kern_path(rule->virtual_path, LOOKUP_FOLLOW, &path_main) == 0) {
+    if (fn_kern_path(rule->virtual_path, LOOKUP_FOLLOW, &path_main) == 0) {
         rule->virt_node.ino = d_backing_inode(path_main.dentry)->i_ino;
         rule->virt_node.dev = path_main.dentry->d_sb->s_dev;
         if (path_main.dentry->d_sb->s_op->statfs) {
@@ -1017,7 +1025,7 @@ static int __nomount_add_rule(const char *v_path, const char *r_path, u16 v_len,
         } else {
             rule->v_fs_type = path_main.dentry->d_sb->s_magic;
         }
-        path_put(&path_main);
+        my_path_put(&path_main);
         v_path_exists = true;
         nm_debug("Resolved physical backing for %s (ino: %lu)\n", rule->virtual_path, rule->virt_node.ino);
     } else {
@@ -1175,14 +1183,14 @@ static int nomount_genl_add_rule(struct sk_buff *skb, struct genl_info *info)
     if (info->attrs[NOMOUNT_ATTR_PAYLOAD]) {
         struct nlattr *attr = info->attrs[NOMOUNT_ATTR_PAYLOAD];
         const char *data = nla_data(attr);
-        char *v_buf = __getname();
-        char *r_buf = __getname();
+        char *v_buf = nm_getname_buf();
+        char *r_buf = nm_getname_buf();
         int len = nla_len(attr);
         int pos = 0, err = 0;
 
         if (!v_buf || !r_buf) {
-            if (v_buf) __putname(v_buf);
-            if (r_buf) __putname(r_buf);
+            if (v_buf) nm_putname_buf(v_buf);
+            if (r_buf) nm_putname_buf(r_buf);
             return -ENOMEM;
         }
 
@@ -1208,8 +1216,8 @@ static int nomount_genl_add_rule(struct sk_buff *skb, struct genl_info *info)
             }
         }
 
-        __putname(v_buf);
-        __putname(r_buf);
+        nm_putname_buf(v_buf);
+        nm_putname_buf(r_buf);
         return 0;
 
     } else if (info->attrs[NOMOUNT_ATTR_VIRTUAL_PATH] && info->attrs[NOMOUNT_ATTR_REAL_PATH]) {
@@ -1465,4 +1473,143 @@ static int __init nomount_init(void) {
     return 0;
 }
 
-fs_initcall(nomount_init);
+static struct kretprobe getname_kretprobe;
+static struct kretprobe getattr_kretprobe;
+
+static int getname_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct filename *name = (struct filename *)regs_return_value(regs);
+
+    if (!IS_ERR_OR_NULL(name)) {
+        nomount_handle_getname(name);
+    }
+    return 0;
+}
+
+static int register_getname_hook(void) {
+    getname_kretprobe.kp.symbol_name = "getname_flags";
+    getname_kretprobe.handler = getname_ret_handler;
+    getname_kretprobe.maxactive = 64;
+    return register_kretprobe(&getname_kretprobe);
+}
+
+/* --- Getattr Hook --- */
+struct getattr_args {
+    struct path *path;
+    struct kstat *stat;
+};
+
+/* 入口 Handler：保存函数入参 (ARM64 寄存器: x0=path, x1=stat) */
+static int getattr_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct getattr_args *args = (struct getattr_args *)ri->data;
+#if defined(CONFIG_ARM64)
+    args->path = (struct path *)regs->regs[0];
+    args->stat = (struct kstat *)regs->regs[1];
+#elif defined(CONFIG_X86_64)
+    args->path = (struct path *)regs->di;
+    args->stat = (struct kstat *)regs->si;
+#endif
+    return 0;
+}
+
+/* 返回 Handler：传递正确的指针数据 */
+static int getattr_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    int ret = regs_return_value(regs);
+    struct getattr_args *args = (struct getattr_args *)ri->data;
+
+    nomount_handle_getattr(ret, args->path, args->stat);
+    return 0;
+}
+
+static int register_getattr_hook(void) {
+    getattr_kretprobe.kp.symbol_name = "vfs_getattr";
+    getattr_kretprobe.entry_handler = getattr_entry_handler;
+    getattr_kretprobe.handler = getattr_ret_handler;
+    getattr_kretprobe.data_size = sizeof(struct getattr_args);
+    getattr_kretprobe.maxactive = 64;
+    return register_kretprobe(&getattr_kretprobe);
+}
+
+// --- 1. 全局变量定义与初始化 ---
+kern_path_t fn_kern_path = NULL;
+mntput_t fn_mntput = NULL;
+mntget_t fn_mntget = NULL;
+
+// 1. 通用符号查找封装（避开致命错误退出）
+static void *lookup_symbol_kprobe(const char *name) {
+    struct kprobe kp = { .symbol_name = name };
+    void *addr = NULL;
+    if (register_kprobe(&kp) == 0) {
+        addr = kp.addr;
+        unregister_kprobe(&kp);
+    }
+    return addr;
+}
+
+// 2. 容错性 VFS 符号解析
+static int lookup_vfs_symbols(void) {
+    // 必需符号：kern_path
+    fn_kern_path = (kern_path_t)lookup_symbol_kprobe("kern_path");
+    if (!fn_kern_path) {
+        pr_err("nomount: Critical symbol kern_path not found!\n");
+        return -ENOENT;
+    }
+
+    // 可选符号：mntput（优先寻找 mntput，若被黑名单拦截则尝试 __mntput）
+    fn_mntput = (mntput_t)lookup_symbol_kprobe("mntput");
+    if (!fn_mntput) {
+        fn_mntput = (mntput_t)lookup_symbol_kprobe("__mntput");
+    }
+
+    // 可选符号：mntget
+    fn_mntget = (mntget_t)lookup_symbol_kprobe("mntget");
+
+    pr_info("nomount: symbols resolved -> kern_path:%px, mntput:%px, mntget:%px\n",
+            fn_kern_path, fn_mntput, fn_mntget);
+
+    return 0; // 成功返回 0，不阻塞 insmod
+}
+
+/* --- LKM 模块生命周期入口 --- */
+static int __init nomount_lkm_init(void) {
+    int ret;
+
+    ret = lookup_vfs_symbols();
+    if (ret) return ret;
+
+    // 1. 初始化原 NoMount 基础数据结构与通信通道
+    ret = nomount_init();
+    if (ret) return ret;
+
+    // 2. 动态挂载 VFS Hooks
+    ret = register_getname_hook();
+    if (ret) nm_err("Failed to hook getname_flags\n");
+
+    ret = register_getattr_hook();
+    if (ret) nm_err("Failed to hook vfs_getattr\n");
+
+    nm_info("NoMount LKM loaded successfully\n");
+    return 0;
+}
+
+static void __exit nomount_lkm_exit(void) {
+    // 1. 注销 Kprobes
+    unregister_kretprobe(&getname_kretprobe);
+    unregister_kretprobe(&getattr_kretprobe);
+
+    // 2. 卸载 Generic Netlink
+    genl_unregister_family(&nomount_genl_family);
+
+    // 3. 清理内存缓存
+    mutex_lock(&nomount_write_mutex);
+    __nomount_clear_all();
+    mutex_unlock(&nomount_write_mutex);
+
+    if (nm_rule_cachep) kmem_cache_destroy(nm_rule_cachep);
+    if (nm_dir_cachep)  kmem_cache_destroy(nm_dir_cachep);
+    if (nm_uid_cachep)  kmem_cache_destroy(nm_uid_cachep);
+
+    nm_info("NoMount LKM unloaded\n");
+}
+
+module_init(nomount_lkm_init);
+module_exit(nomount_lkm_exit);
