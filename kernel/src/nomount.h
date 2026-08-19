@@ -23,41 +23,41 @@
 #define NM_INO_TYPE_VIRTUAL (1 << 1)
 #define NM_INO_TYPE_DIR     (1 << 2)
 
-// --- 1. 动态符号类型定义 ---
+// --- 1. 未导出符号的函数指针类型定义 ---
 typedef int (*kern_path_t)(const char *name, unsigned int flags, struct path *path);
+typedef void (*putname_t)(struct filename *name);
+typedef void (*path_get_t)(const struct path *path);
 typedef void (*mntput_t)(struct vfsmount *mnt);
-typedef struct vfsmount *(*mntget_t)(struct vfsmount *mnt);
 
-// --- 2. 全局变量 extern 声明（不要在 .h 中赋初始值）---
+// --- 2. 全局符号变量 extern 声明 ---
 extern kern_path_t fn_kern_path;
+extern putname_t fn_putname;
+extern path_get_t fn_path_get;
 extern mntput_t fn_mntput;
-extern mntget_t fn_mntget;
 
-// --- 3. 替换封装函数 ---
+// --- 3. 安全调用封装 ---
+static inline void my_putname(struct filename *name) {
+    if (fn_putname && !IS_ERR_OR_NULL(name))
+        fn_putname(name);
+}
+
 static inline void my_path_get(const struct path *path) {
-    dget(path->dentry);
-    if (fn_mntget) fn_mntget(path->mnt);
+    if (fn_path_get)
+        fn_path_get(path);
+    else
+        dget(path->dentry);
 }
 
 static inline void my_path_put(const struct path *path) {
     dput(path->dentry);
-    if (fn_mntput) fn_mntput(path->mnt);
+    if (fn_mntput)
+        fn_mntput(path->mnt);
 }
 
-static inline struct dentry *my_dget_parent(struct dentry *dentry) {
-    struct dentry *parent;
-    rcu_read_lock();
-    parent = dget(rcu_dereference(dentry->d_parent));
-    rcu_read_unlock();
-    return parent;
-}
-
-/* 替换原代码中的 __getname() */
 static inline char *nm_getname_buf(void) {
-    return kmalloc(PATH_MAX, GFP_ATOMIC);
+    return kmalloc(PATH_MAX, in_atomic() ? GFP_ATOMIC : GFP_KERNEL);
 }
 
-/* 替换原代码中的 __putname() */
 static inline void nm_putname_buf(const void *buf) {
     kfree(buf);
 }

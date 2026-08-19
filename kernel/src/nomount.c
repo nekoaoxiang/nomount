@@ -1473,68 +1473,189 @@ static int __init nomount_init(void) {
     return 0;
 }
 
-static struct kretprobe getname_kretprobe;
-static struct kretprobe getattr_kretprobe;
+// --- 全局符号定义 ---
+kern_path_t fn_kern_path = NULL;
+putname_t fn_putname = NULL;
+path_get_t fn_path_get = NULL;
+mntput_t fn_mntput = NULL;
 
+// --- Kretprobes 实例 ---
+static struct kretprobe getname_kp;
+static struct kretprobe getattr_kp;
+static struct kretprobe dpath_kp;
+static struct kretprobe statfs_kp;
+static struct kretprobe iterate_kp;
+static struct kretprobe perm_kp;
+static struct kretprobe maps_kp;
+
+// 参数传递结构体
+struct getattr_args { struct path *path; struct kstat *stat; };
+struct dpath_args   { struct path *path; char *buf; int buflen; };
+struct statfs_args  { struct path *path; struct kstatfs *buf; };
+struct iterate_args { struct file *file; struct dir_context *ctx; };
+struct perm_args    { struct inode *inode; int mask; };
+
+// --- Handlers 实现 ---
+
+// Hook 1: getname_flags
 static int getname_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct filename *name = (struct filename *)regs_return_value(regs);
-
     if (!IS_ERR_OR_NULL(name)) {
-        nomount_handle_getname(name);
+        struct filename *res = nomount_handle_getname(name);
+        if (IS_ERR(res)) {
+            my_putname(name);
+            regs_set_return_value(regs, (unsigned long)res);
+        }
     }
     return 0;
 }
 
-static int register_getname_hook(void) {
-    getname_kretprobe.kp.symbol_name = "getname_flags";
-    getname_kretprobe.handler = getname_ret_handler;
-    getname_kretprobe.maxactive = 64;
-    return register_kretprobe(&getname_kretprobe);
-}
-
-/* --- Getattr Hook --- */
-struct getattr_args {
-    struct path *path;
-    struct kstat *stat;
-};
-
-/* 入口 Handler：保存函数入参 (ARM64 寄存器: x0=path, x1=stat) */
+// Hook 2: vfs_getattr
 static int getattr_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
     struct getattr_args *args = (struct getattr_args *)ri->data;
 #if defined(CONFIG_ARM64)
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    args->path = (struct path *)regs->regs[1];
+    args->stat = (struct kstat *)regs->regs[2];
+  #else
     args->path = (struct path *)regs->regs[0];
     args->stat = (struct kstat *)regs->regs[1];
+  #endif
 #elif defined(CONFIG_X86_64)
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    args->path = (struct path *)regs->si;
+    args->stat = (struct kstat *)regs->dx;
+  #else
     args->path = (struct path *)regs->di;
     args->stat = (struct kstat *)regs->si;
+  #endif
 #endif
     return 0;
 }
-
-/* 返回 Handler：传递正确的指针数据 */
 static int getattr_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
     int ret = regs_return_value(regs);
     struct getattr_args *args = (struct getattr_args *)ri->data;
-
-    nomount_handle_getattr(ret, args->path, args->stat);
+    if (args->path && args->stat)
+        nomount_handle_getattr(ret, args->path, args->stat);
     return 0;
 }
 
-static int register_getattr_hook(void) {
-    getattr_kretprobe.kp.symbol_name = "vfs_getattr";
-    getattr_kretprobe.entry_handler = getattr_entry_handler;
-    getattr_kretprobe.handler = getattr_ret_handler;
-    getattr_kretprobe.data_size = sizeof(struct getattr_args);
-    getattr_kretprobe.maxactive = 64;
-    return register_kretprobe(&getattr_kretprobe);
+// Hook 3: d_path
+static int dpath_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct dpath_args *args = (struct dpath_args *)ri->data;
+#if defined(CONFIG_ARM64)
+    args->path = (struct path *)regs->regs[0];
+    args->buf = (char *)regs->regs[1];
+    args->buflen = (int)regs->regs[2];
+#elif defined(CONFIG_X86_64)
+    args->path = (struct path *)regs->di;
+    args->buf = (char *)regs->si;
+    args->buflen = (int)regs->dx;
+#endif
+    return 0;
+}
+static int dpath_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct dpath_args *args = (struct dpath_args *)ri->data;
+    if (args->path && args->buf) {
+        char *nm_path = nomount_handle_dpath(args->path, args->buf, args->buflen);
+        if (unlikely(nm_path))
+            regs_set_return_value(regs, (unsigned long)nm_path);
+    }
+    return 0;
 }
 
-// --- 1. 全局变量定义与初始化 ---
-kern_path_t fn_kern_path = NULL;
-mntput_t fn_mntput = NULL;
-mntget_t fn_mntget = NULL;
+// Hook 4: vfs_statfs
+static int statfs_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct statfs_args *args = (struct statfs_args *)ri->data;
+#if defined(CONFIG_ARM64)
+    args->path = (struct path *)regs->regs[0];
+    args->buf = (struct kstatfs *)regs->regs[1];
+#elif defined(CONFIG_X86_64)
+    args->path = (struct path *)regs->di;
+    args->buf = (struct kstatfs *)regs->si;
+#endif
+    return 0;
+}
+static int statfs_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct statfs_args *args = (struct statfs_args *)ri->data;
+    if (regs_return_value(regs) == 0 && args->path && args->buf)
+        nomount_spoof_statfs(args->path, args->buf);
+    return 0;
+}
 
-// 1. 通用符号查找封装（避开致命错误退出）
+// Hook 5: iterate_dir
+static int iterate_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct iterate_args *args = (struct iterate_args *)ri->data;
+#if defined(CONFIG_ARM64)
+    args->file = (struct file *)regs->regs[0];
+    args->ctx = (struct dir_context *)regs->regs[1];
+#elif defined(CONFIG_X86_64)
+    args->file = (struct file *)regs->di;
+    args->ctx = (struct dir_context *)regs->si;
+#endif
+    return 0;
+}
+static int iterate_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct iterate_args *args = (struct iterate_args *)ri->data;
+    if (args->file && args->ctx) {
+        int res = nomount_handle_iterate_dir(args->file, args->ctx);
+        regs_set_return_value(regs, (unsigned long)res);
+    }
+    return 0;
+}
+
+// Hook 6: inode_permission
+static int perm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct perm_args *args = (struct perm_args *)ri->data;
+#if defined(CONFIG_ARM64)
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    args->inode = (struct inode *)regs->regs[1];
+    args->mask = (int)regs->regs[2];
+  #else
+    args->inode = (struct inode *)regs->regs[0];
+    args->mask = (int)regs->regs[1];
+  #endif
+#elif defined(CONFIG_X86_64)
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    args->inode = (struct inode *)regs->si;
+    args->mask = (int)regs->dx;
+  #else
+    args->inode = (struct inode *)regs->di;
+    args->mask = (int)regs->si;
+  #endif
+#endif
+    return 0;
+}
+static int perm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct perm_args *args = (struct perm_args *)ri->data;
+    if (args->inode) {
+        int nm_perm = nomount_handle_permission(args->inode, args->mask);
+        if (unlikely(nm_perm < 0))
+            regs_set_return_value(regs, (unsigned long)nm_perm);
+        else if (unlikely(nm_perm > 0))
+            regs_set_return_value(regs, 0); // 强行放行
+    }
+    return 0;
+}
+
+// Hook 7: show_map_vma
+static int maps_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct vm_area_struct *vma;
+#if defined(CONFIG_ARM64)
+    vma = (struct vm_area_struct *)regs->regs[1];
+#elif defined(CONFIG_X86_64)
+    vma = (struct vm_area_struct *)regs->si;
+#endif
+    if (vma && vma->vm_file) {
+        struct inode *inode = file_inode(vma->vm_file);
+        dev_t dev = inode->i_sb->s_dev;
+        unsigned long ino = inode->i_ino;
+        nomount_spoof_mmap_metadata(inode, &dev, &ino);
+    }
+    return 0;
+}
+
+// --- 符号解析与注册 ---
 static void *lookup_symbol_kprobe(const char *name) {
     struct kprobe kp = { .symbol_name = name };
     void *addr = NULL;
@@ -1545,61 +1666,101 @@ static void *lookup_symbol_kprobe(const char *name) {
     return addr;
 }
 
-// 2. 容错性 VFS 符号解析
 static int lookup_vfs_symbols(void) {
-    // 必需符号：kern_path
     fn_kern_path = (kern_path_t)lookup_symbol_kprobe("kern_path");
-    if (!fn_kern_path) {
-        pr_err("nomount: Critical symbol kern_path not found!\n");
+    fn_putname   = (putname_t)lookup_symbol_kprobe("putname");
+    fn_path_get  = (path_get_t)lookup_symbol_kprobe("path_get");
+    fn_mntput    = (mntput_t)lookup_symbol_kprobe("mntput");
+    if (!fn_mntput)
+        fn_mntput = (mntput_t)lookup_symbol_kprobe("__mntput");
+
+    if (!fn_kern_path || !fn_putname) {
+        pr_err("nomount: Critical VFS symbols missing!\n");
         return -ENOENT;
     }
-
-    // 可选符号：mntput（优先寻找 mntput，若被黑名单拦截则尝试 __mntput）
-    fn_mntput = (mntput_t)lookup_symbol_kprobe("mntput");
-    if (!fn_mntput) {
-        fn_mntput = (mntput_t)lookup_symbol_kprobe("__mntput");
-    }
-
-    // 可选符号：mntget
-    fn_mntget = (mntget_t)lookup_symbol_kprobe("mntget");
-
-    pr_info("nomount: symbols resolved -> kern_path:%px, mntput:%px, mntget:%px\n",
-            fn_kern_path, fn_mntput, fn_mntget);
-
-    return 0; // 成功返回 0，不阻塞 insmod
+    return 0;
 }
 
-/* --- LKM 模块生命周期入口 --- */
-static int __init nomount_lkm_init(void) {
-    int ret;
+static int register_all_hooks(void) {
+    getname_kp.kp.symbol_name = "getname_flags";
+    getname_kp.handler = getname_ret_handler;
+    getname_kp.maxactive = 64;
+    register_kretprobe(&getname_kp);
 
-    ret = lookup_vfs_symbols();
+    getattr_kp.kp.symbol_name = "vfs_getattr";
+    getattr_kp.entry_handler = getattr_entry_handler;
+    getattr_kp.handler = getattr_ret_handler;
+    getattr_kp.data_size = sizeof(struct getattr_args);
+    getattr_kp.maxactive = 64;
+    register_kretprobe(&getattr_kp);
+
+    dpath_kp.kp.symbol_name = "d_path";
+    dpath_kp.entry_handler = dpath_entry_handler;
+    dpath_kp.handler = dpath_ret_handler;
+    dpath_kp.data_size = sizeof(struct dpath_args);
+    dpath_kp.maxactive = 64;
+    register_kretprobe(&dpath_kp);
+
+    statfs_kp.kp.symbol_name = "vfs_statfs";
+    statfs_kp.entry_handler = statfs_entry_handler;
+    statfs_kp.handler = statfs_ret_handler;
+    statfs_kp.data_size = sizeof(struct statfs_args);
+    statfs_kp.maxactive = 64;
+    register_kretprobe(&statfs_kp);
+
+    iterate_kp.kp.symbol_name = "iterate_dir";
+    iterate_kp.entry_handler = iterate_entry_handler;
+    iterate_kp.handler = iterate_ret_handler;
+    iterate_kp.data_size = sizeof(struct iterate_args);
+    iterate_kp.maxactive = 64;
+    register_kretprobe(&iterate_kp);
+
+    perm_kp.kp.symbol_name = "inode_permission";
+    perm_kp.entry_handler = perm_entry_handler;
+    perm_kp.handler = perm_ret_handler;
+    perm_kp.data_size = sizeof(struct perm_args);
+    perm_kp.maxactive = 64;
+    register_kretprobe(&perm_kp);
+
+    maps_kp.kp.symbol_name = "show_map_vma";
+    maps_kp.entry_handler = maps_entry_handler;
+    maps_kp.maxactive = 64;
+    register_kretprobe(&maps_kp);
+
+    return 0;
+}
+
+static void unregister_safe(struct kretprobe *rp) {
+    if (rp->kp.addr) {
+        unregister_kretprobe(rp);
+        rp->kp.addr = NULL;
+    }
+}
+
+// --- LKM 生命周期 ---
+static int __init nomount_lkm_init(void) {
+    int ret = lookup_vfs_symbols();
     if (ret) return ret;
 
-    // 1. 初始化原 NoMount 基础数据结构与通信通道
     ret = nomount_init();
     if (ret) return ret;
 
-    // 2. 动态挂载 VFS Hooks
-    ret = register_getname_hook();
-    if (ret) nm_err("Failed to hook getname_flags\n");
-
-    ret = register_getattr_hook();
-    if (ret) nm_err("Failed to hook vfs_getattr\n");
-
-    nm_info("NoMount LKM loaded successfully\n");
+    register_all_hooks();
+    pr_info("nomount: LKM fully initialized with 7 VFS hooks\n");
     return 0;
 }
 
 static void __exit nomount_lkm_exit(void) {
-    // 1. 注销 Kprobes
-    unregister_kretprobe(&getname_kretprobe);
-    unregister_kretprobe(&getattr_kretprobe);
+    unregister_safe(&getname_kp);
+    unregister_safe(&getattr_kp);
+    unregister_safe(&dpath_kp);
+    unregister_safe(&statfs_kp);
+    unregister_safe(&iterate_kp);
+    unregister_safe(&perm_kp);
+    unregister_safe(&maps_kp);
 
-    // 2. 卸载 Generic Netlink
     genl_unregister_family(&nomount_genl_family);
 
-    // 3. 清理内存缓存
     mutex_lock(&nomount_write_mutex);
     __nomount_clear_all();
     mutex_unlock(&nomount_write_mutex);
@@ -1608,7 +1769,7 @@ static void __exit nomount_lkm_exit(void) {
     if (nm_dir_cachep)  kmem_cache_destroy(nm_dir_cachep);
     if (nm_uid_cachep)  kmem_cache_destroy(nm_uid_cachep);
 
-    nm_info("NoMount LKM unloaded\n");
+    pr_info("nomount: LKM unloaded safely\n");
 }
 
 module_init(nomount_lkm_init);
