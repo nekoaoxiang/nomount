@@ -62,6 +62,19 @@ static inline void nm_putname_buf(const void *buf) {
     kfree(buf);
 }
 
+// 替换原有的 dget_parent 调用
+static inline struct dentry *nomount_nomount_dget_parent(struct dentry *dentry) {
+    struct dentry *parent;
+    
+    // 内核通常使用 spin_lock 或 rcu 保护 d_parent，最安全标准的写法如下：
+    spin_lock(&dentry->d_lock);
+    parent = dget_dlock(dentry->d_parent);
+    spin_unlock(&dentry->d_lock);
+    
+    return parent;
+}
+
+
 static DEFINE_HASHTABLE(nomount_rules_ht,     NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(nomount_inodes_ht,    NOMOUNT_HASH_BITS);
 static DEFINE_HASHTABLE(nomount_basenames_ht, NOMOUNT_HASH_BITS);

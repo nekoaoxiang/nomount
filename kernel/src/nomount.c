@@ -655,7 +655,7 @@ static void __nomount_collect_parents(struct nomount_rule *rule, struct dentry *
         *slash = '\0';
         slashes[p_count++] = slash;
 
-        parent = dget_parent(d);
+        parent = nomount_dget_parent(d);
         dput(d);
         d = parent;
     }
