@@ -1,0 +1,53 @@
+name: Build NoMount LKM
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-nomount-ko:
+    name: Build nomount.ko for android14-6.1 (ARM64)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:android14-6.1-20260313
+      options: --privileged
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Build nomount.ko
+        run: |
+          git config --global --add safe.directory /__w/${{ github.event.repository.name }}/${{ github.event.repository.name }}
+          
+          cd kernel
+          echo "=== Building nomount.ko for android14-6.1 ==="
+          
+          # 使用 DDK 内核路径进行编译
+          make KDIR=/opt/ddk/kdir/android14-6.1 CC=clang
+          
+          echo "=== Build completed ==="
+
+          # 创建输出目录并复制产物
+          OUT_DIR=/github/workspace/out/aarch64
+          mkdir -p $OUT_DIR
+          
+          OUTPUT_NAME="android14-6.1_nomount.ko"
+          cp nomount.ko "$OUT_DIR/$OUTPUT_NAME"
+          
+          echo "Copied to: $OUT_DIR/$OUTPUT_NAME"
+          ls -la "$OUT_DIR/$OUTPUT_NAME"
+          echo "Size before strip: $(du -h "$OUT_DIR/$OUTPUT_NAME" | cut -f1)"
+          
+          # 去除符号体积优化
+          llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
+          echo "Size after stripping: $(du -h "$OUT_DIR/$OUTPUT_NAME" | cut -f1)"
+
+      - name: Upload nomount.ko artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-android14-6.1-nomount-lkm
+          path: /github/workspace/out/aarch64/android14-6.1_nomount.ko
