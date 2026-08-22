@@ -4,66 +4,83 @@ on:
   workflow_dispatch:
     inputs:
       ddk_release:
-        description: 'DDK release version'
+        description: "DDK release version"
         required: false
-        default: '20260313'
+        default: "20260313"
         type: string
 
 jobs:
   build-bbr:
     name: Build tcp_bbr.ko for ${{ matrix.kmi }}
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         kmi:
           - android14-6.1
+
     container:
       image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ github.event.inputs.ddk_release || '20260313' }}
       options: --privileged
 
     steps:
-    - name: Build tcp_bbr.ko
-      run: |
-        echo "=== Building tcp_bbr.ko for KMI: ${{ matrix.kmi }} ==="
+      - name: Build tcp_bbr.ko
+        run: |
+          echo "=== Building self-contained tcp_bbr.ko for KMI: ${{ matrix.kmi }} ==="
 
-        # 1. 创建临时编译目录
-        WORKDIR=/tmp/bbr_build
-        mkdir -p $WORKDIR
-        cd $WORKDIR
+          WORKDIR=/tmp/bbr_build
+          mkdir -p "$WORKDIR"
+          cd "$WORKDIR"
 
-        # 2. 从容器自带的源码树中复制 tcp_bbr.c
-        SRC_BBR=/opt/ddk/src/${{ matrix.kmi }}/net/ipv4/tcp_bbr.c
-        if [ ! -f "$SRC_BBR" ]; then
-            echo "ERROR: $SRC_BBR not found!"
-            exit 1
-        fi
-        cp $SRC_BBR .
+          SRC_BASE=/opt/ddk/src/${{ matrix.kmi }}
 
-        # 3. 动态生成外置模块 Makefile
-        cat << 'EOF' > Makefile
-        obj-m += tcp_bbr.o
-        EOF
+          # 1. Copy tcp_bbr.c and rename it to avoid Kbuild naming conflicts
+          cp "$SRC_BASE/net/ipv4/tcp_bbr.c" ./tcp_bbr_main.c
 
-        # 4. 调用 ddk-min 内置的 KDIR 进行模块编译
-        KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
-        make -C $KDIR M=$WORKDIR modules
+          # 2. Copy the dependent minmax.c into the same module
+          if [ -f "$SRC_BASE/lib/minmax.c" ]; then
+            cp "$SRC_BASE/lib/minmax.c" ./minmax.c
+            HAS_MINMAX=1
+          else
+            HAS_MINMAX=0
+          fi
 
-        # 5. 输出并剥离调试符号
-        OUT_DIR=/github/workspace/out
-        mkdir -p $OUT_DIR
-        OUTPUT_NAME="${{ matrix.kmi }}_tcp_bbr.ko"
+          # 3. Stub register_btf_kfunc_id_set()
+          #    This function is not exported by GKI.
+          sed -i '1i #define register_btf_kfunc_id_set(...) (0)' tcp_bbr_main.c
 
-        cp tcp_bbr.ko "$OUT_DIR/$OUTPUT_NAME"
-        
-        echo "=== Build output ==="
-        ls -la "$OUT_DIR/$OUTPUT_NAME"
-        echo "Size before strip: $(du -h "$OUT_DIR/$OUTPUT_NAME" | cut -f1)"
-        llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
-        echo "Size after strip: $(du -h "$OUT_DIR/$OUTPUT_NAME" | cut -f1)"
+          # 4. Generate Makefile
+          if [ "$HAS_MINMAX" = "1" ]; then
+            cat > Makefile << 'EOF'
+          obj-m += tcp_bbr.o
+          tcp_bbr-y := tcp_bbr_main.o minmax.o
+          EOF
+          else
+            cat > Makefile << 'EOF'
+          obj-m += tcp_bbr.o
+          tcp_bbr-y := tcp_bbr_main.o
+          EOF
+          fi
 
-    - name: Upload tcp_bbr.ko artifact
-      uses: actions/upload-artifact@v7
-      with:
-        name: tcp_bbr-${{ matrix.kmi }}
-        path: /github/workspace/out/${{ matrix.kmi }}_tcp_bbr.ko
+          # 5. Build
+          KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
+
+          make -C "$KDIR" M="$WORKDIR" modules
+
+          # 6. Collect and strip the output
+          OUT_DIR=/github/workspace/out
+          mkdir -p "$OUT_DIR"
+
+          OUTPUT_NAME="${{ matrix.kmi }}_tcp_bbr.ko"
+
+          cp tcp_bbr.ko "$OUT_DIR/$OUTPUT_NAME"
+          llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
+
+          echo "Build completed: $OUT_DIR/$OUTPUT_NAME"
+
+      - name: Upload tcp_bbr.ko artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tcp_bbr-${{ matrix.kmi }}
+          path: /github/workspace/out/${{ matrix.kmi }}_tcp_bbr.ko
