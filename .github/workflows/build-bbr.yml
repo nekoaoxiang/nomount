@@ -4,24 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       ddk_release:
-        description: "DDK release version"
+        description: 'DDK release version'
         required: false
-        default: "20260313"
+        default: '20260313'
+        type: string
+  workflow_call:
+    inputs:
+      ddk_release:
+        description: 'DDK release version'
+        required: false
+        default: '20260313'
         type: string
 
 jobs:
   build-bbr:
     name: Build tcp_bbr.ko for ${{ matrix.kmi }}
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
       matrix:
         kmi:
           - android14-6.1
-
     container:
-      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ github.event.inputs.ddk_release || '20260313' }}
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}
       options: --privileged
 
     steps:
@@ -35,44 +40,47 @@ jobs:
 
           SRC_BASE=/opt/ddk/src/${{ matrix.kmi }}
 
-          # 1. 复制 tcp_bbr.c
+          # 1. 复制 tcp_bbr.c 源码
           cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
 
-          # 2. 动态搜索 minmax 源码路径并复制
+          # 2. 动态搜索 minmax 源码并复制
           MINMAX_SRC=$(find $SRC_BASE -type f \( -name "minmax.c" -o -name "win_minmax.c" \) | head -n 1)
 
           if [ -n "$MINMAX_SRC" ]; then
               echo "Found minmax source at: $MINMAX_SRC"
               cp "$MINMAX_SRC" ./minmax.c
-              HAS_MINMAX=1
           else
               echo "ERROR: Could not find minmax source file in $SRC_BASE!"
               exit 1
           fi
 
-          # 3. 打桩掉 GKI 未导出的 BTF/eBPF 注册函数
-          #    避开头文件 include 区域
+          # 3. 擦除 minmax.c 中的 EXPORT_SYMBOL，防止 modpost 报重复导出错误
+          sed -i 's/EXPORT_SYMBOL.*//g' minmax.c
+
+          # 4. 重命名 minmax 函数前缀（内部私有化），实现完全解耦
+          sed -i 's/minmax_running_/bbr_minmax_running_/g' minmax.c
+          sed -i 's/minmax_running_/bbr_minmax_running_/g' tcp_bbr_main.c
+
+          # 5. 打桩掉 GKI 未导出的 BTF/eBPF 注册函数
           sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)\n#define unregister_btf_kfunc_id_set(...) ((void)0)' tcp_bbr_main.c
 
-          # 4. 生成 Makefile，强制将 minmax.o 链接进 tcp_bbr.ko
+          # 6. 生成 Makefile，将 minmax.o 静态链接进 tcp_bbr.ko
           cat << 'EOF' > Makefile
           obj-m += tcp_bbr.o
           tcp_bbr-y := tcp_bbr_main.o minmax.o
           EOF
 
-          # 5. 执行编译
+          # 7. 执行编译
           KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
           make -C $KDIR M=$WORKDIR modules
 
-          # 6. 检查符号状态
-          #    验证 minmax_running_max 是否已内置
-          echo "=== Checking symbol status in built object ==="
-          llvm-nm tcp_bbr.o | grep minmax_running_max || true
+          # 8. 验证私有化符号状态
+          echo "=== Checking internal symbol status ==="
+          llvm-nm tcp_bbr.o | grep bbr_minmax || true
 
-          # 7. 收集产物并 Strip 符号
+          # 9. 收集产物并 Strip 符号
           OUT_DIR=/github/workspace/out
           mkdir -p $OUT_DIR
-
           OUTPUT_NAME="${{ matrix.kmi }}_tcp_bbr.ko"
 
           cp tcp_bbr.ko "$OUT_DIR/$OUTPUT_NAME"
