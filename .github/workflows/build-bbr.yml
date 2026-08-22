@@ -30,54 +30,49 @@ jobs:
           echo "=== Building self-contained tcp_bbr.ko for KMI: ${{ matrix.kmi }} ==="
 
           WORKDIR=/tmp/bbr_build
-          mkdir -p "$WORKDIR"
-          cd "$WORKDIR"
+          mkdir -p $WORKDIR
+          cd $WORKDIR
 
           SRC_BASE=/opt/ddk/src/${{ matrix.kmi }}
 
-          # 1. Copy tcp_bbr.c and rename it to avoid Kbuild naming conflicts
-          cp "$SRC_BASE/net/ipv4/tcp_bbr.c" ./tcp_bbr_main.c
+          # 1. 复制 tcp_bbr.c 并重命名为 tcp_bbr_main.c
+          cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
 
-          # 2. Copy the dependent minmax.c into the same module
+          # 2. 复制依赖的 minmax.c
           if [ -f "$SRC_BASE/lib/minmax.c" ]; then
-            cp "$SRC_BASE/lib/minmax.c" ./minmax.c
-            HAS_MINMAX=1
-          else
-            HAS_MINMAX=0
+              cp $SRC_BASE/lib/minmax.c ./minmax.c
+              HAS_MINMAX=1
           fi
 
-          # 3. Stub register_btf_kfunc_id_set()
-          #    This function is not exported by GKI.
-          sed -i '1i #define register_btf_kfunc_id_set(...) (0)' tcp_bbr_main.c
+          # 3. 在 static int __init 之前插入打桩宏，避开头文件 include 区域
+          sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)' tcp_bbr_main.c
 
-          # 4. Generate Makefile
+          # 4. 生成 Makefile，将 minmax.o 一起打入 tcp_bbr.ko
           if [ "$HAS_MINMAX" = "1" ]; then
-            cat > Makefile << 'EOF'
+              cat << 'EOF' > Makefile
           obj-m += tcp_bbr.o
           tcp_bbr-y := tcp_bbr_main.o minmax.o
           EOF
           else
-            cat > Makefile << 'EOF'
+              cat << 'EOF' > Makefile
           obj-m += tcp_bbr.o
           tcp_bbr-y := tcp_bbr_main.o
           EOF
           fi
 
-          # 5. Build
+          # 5. 执行编译
           KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
+          make -C $KDIR M=$WORKDIR modules
 
-          make -C "$KDIR" M="$WORKDIR" modules
-
-          # 6. Collect and strip the output
+          # 6. 收集产物并剥离符号
           OUT_DIR=/github/workspace/out
-          mkdir -p "$OUT_DIR"
-
+          mkdir -p $OUT_DIR
           OUTPUT_NAME="${{ matrix.kmi }}_tcp_bbr.ko"
 
           cp tcp_bbr.ko "$OUT_DIR/$OUTPUT_NAME"
           llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
 
-          echo "Build completed: $OUT_DIR/$OUTPUT_NAME"
+          echo "=== Build succeeded: $OUT_DIR/$OUTPUT_NAME ==="
 
       - name: Upload tcp_bbr.ko artifact
         uses: actions/upload-artifact@v7
