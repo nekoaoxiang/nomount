@@ -35,38 +35,44 @@ jobs:
 
           SRC_BASE=/opt/ddk/src/${{ matrix.kmi }}
 
-          # 1. 复制 tcp_bbr.c 并重命名为 tcp_bbr_main.c
+          # 1. 复制 tcp_bbr.c
           cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
 
-          # 2. 复制依赖的 minmax.c
-          if [ -f "$SRC_BASE/lib/minmax.c" ]; then
-              cp $SRC_BASE/lib/minmax.c ./minmax.c
+          # 2. 动态搜索 minmax 源码路径并复制
+          MINMAX_SRC=$(find $SRC_BASE -type f \( -name "minmax.c" -o -name "win_minmax.c" \) | head -n 1)
+
+          if [ -n "$MINMAX_SRC" ]; then
+              echo "Found minmax source at: $MINMAX_SRC"
+              cp "$MINMAX_SRC" ./minmax.c
               HAS_MINMAX=1
+          else
+              echo "ERROR: Could not find minmax source file in $SRC_BASE!"
+              exit 1
           fi
 
-          # 3. 在 static int __init 之前插入打桩宏，避开头文件 include 区域
-          sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)' tcp_bbr_main.c
+          # 3. 打桩掉 GKI 未导出的 BTF/eBPF 注册函数
+          #    避开头文件 include 区域
+          sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)\n#define unregister_btf_kfunc_id_set(...) ((void)0)' tcp_bbr_main.c
 
-          # 4. 生成 Makefile，将 minmax.o 一起打入 tcp_bbr.ko
-          if [ "$HAS_MINMAX" = "1" ]; then
-              cat << 'EOF' > Makefile
+          # 4. 生成 Makefile，强制将 minmax.o 链接进 tcp_bbr.ko
+          cat << 'EOF' > Makefile
           obj-m += tcp_bbr.o
           tcp_bbr-y := tcp_bbr_main.o minmax.o
           EOF
-          else
-              cat << 'EOF' > Makefile
-          obj-m += tcp_bbr.o
-          tcp_bbr-y := tcp_bbr_main.o
-          EOF
-          fi
 
           # 5. 执行编译
           KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
           make -C $KDIR M=$WORKDIR modules
 
-          # 6. 收集产物并剥离符号
+          # 6. 检查符号状态
+          #    验证 minmax_running_max 是否已内置
+          echo "=== Checking symbol status in built object ==="
+          llvm-nm tcp_bbr.o | grep minmax_running_max || true
+
+          # 7. 收集产物并 Strip 符号
           OUT_DIR=/github/workspace/out
           mkdir -p $OUT_DIR
+
           OUTPUT_NAME="${{ matrix.kmi }}_tcp_bbr.ko"
 
           cp tcp_bbr.ko "$OUT_DIR/$OUTPUT_NAME"
