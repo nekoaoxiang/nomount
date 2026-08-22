@@ -70,6 +70,9 @@ jobs:
           tcp_bbr-y := tcp_bbr_main.o minmax.o
           EOF
 
+          # 在 include 区域下方注入前置声明
+          sed -i '/#include/a struct dentry *nomount_dget_parent(struct dentry *d);' kernel/src/nomount.c
+
           # 7. 执行编译
           KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
           make -C $KDIR M=$WORKDIR modules
