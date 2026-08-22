@@ -43,45 +43,38 @@ jobs:
           # 1. 复制 tcp_bbr.c 源码
           cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
 
-          # 2. 动态搜索 minmax 源码并复制
+          # 2. 动态查找 minmax 源码
           MINMAX_SRC=$(find $SRC_BASE -type f \( -name "minmax.c" -o -name "win_minmax.c" \) | head -n 1)
 
           if [ -n "$MINMAX_SRC" ]; then
               echo "Found minmax source at: $MINMAX_SRC"
-              cp "$MINMAX_SRC" ./minmax.c
+              # 剥离 EXPORT_SYMBOL 与 #include，重命名 minmax 函数，并追加到 tcp_bbr_main.c 内部
+              grep -v -E "EXPORT_SYMBOL|#include" "$MINMAX_SRC" | \
+              sed 's/\bminmax_running_max\b/bbr_minmax_running_max/g' | \
+              sed 's/\bminmax_running_min\b/bbr_minmax_running_min/g' | \
+              sed 's/\bminmax_subwin_update\b/bbr_minmax_subwin_update/g' >> ./tcp_bbr_main.c
           else
               echo "ERROR: Could not find minmax source file in $SRC_BASE!"
               exit 1
           fi
 
-          # 3. 擦除 minmax.c 中的 EXPORT_SYMBOL，防止 modpost 报重复导出错误
-          sed -i 's/EXPORT_SYMBOL.*//g' minmax.c
+          # 3. 重命名 tcp_bbr_main.c 中对 minmax 函数的调用
+          sed -i 's/\bminmax_running_max\b/bbr_minmax_running_max/g' tcp_bbr_main.c
+          sed -i 's/\bminmax_running_min\b/bbr_minmax_running_min/g' tcp_bbr_main.c
+          sed -i 's/\bminmax_subwin_update\b/bbr_minmax_subwin_update/g' tcp_bbr_main.c
 
-          # 4. 重命名 minmax 函数前缀（内部私有化），实现完全解耦
-          sed -i 's/minmax_running_/bbr_minmax_running_/g' minmax.c
-          sed -i 's/minmax_running_/bbr_minmax_running_/g' tcp_bbr_main.c
-
-          # 5. 打桩掉 GKI 未导出的 BTF/eBPF 注册函数
+          # 4. 打桩 GKI 未导出的 BTF/eBPF 注册函数
           sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)\n#define unregister_btf_kfunc_id_set(...) ((void)0)' tcp_bbr_main.c
 
-          # 6. 生成 Makefile，将 minmax.o 静态链接进 tcp_bbr.ko
-          cat << 'EOF' > Makefile
-          obj-m += tcp_bbr.o
-          tcp_bbr-y := tcp_bbr_main.o minmax.o
-          EOF
+          # 5. 生成单文件构建的 Makefile
+          echo "obj-m += tcp_bbr.o" > Makefile
+          echo "tcp_bbr-y := tcp_bbr_main.o" >> Makefile
 
-          # 在 include 区域下方注入前置声明
-          sed -i '/#include/a struct dentry *nomount_dget_parent(struct dentry *d);' kernel/src/nomount.c
-
-          # 7. 执行编译
+          # 6. 执行编译
           KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
           make -C $KDIR M=$WORKDIR modules
 
-          # 8. 验证私有化符号状态
-          echo "=== Checking internal symbol status ==="
-          llvm-nm tcp_bbr.o | grep bbr_minmax || true
-
-          # 9. 收集产物并 Strip 符号
+          # 7. 收集产物并 Strip 调试符号
           OUT_DIR=/github/workspace/out
           mkdir -p $OUT_DIR
           OUTPUT_NAME="${{ matrix.kmi }}_tcp_bbr.ko"
