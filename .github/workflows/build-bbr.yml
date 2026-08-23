@@ -47,12 +47,20 @@ jobs:
 
           SRC_BASE=/opt/ddk/src/$KMI
 
-          # 1. 获取对应版本的 BBR 源码
+          # 1. 获取源码
           if [ "$VARIANT" = "v1" ]; then
               cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
           elif [ "$VARIANT" = "v3" ]; then
               git clone --depth 1 -b v3 https://github.com/google/bbr.git /tmp/google_bbr
               cp /tmp/google_bbr/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
+
+              # --- 对 BBRv3 源码进行 GKI 6.1 适配 ---
+              # A. 将 Google 私有 rate_sample 字段映射回原生 GKI 6.1 结构体字段
+              sed -i 's/rs->lost/rs->losses/g' tcp_bbr_main.c
+              sed -i 's/rs->tx_in_flight/rs->prior_in_flight/g' tcp_bbr_main.c
+
+              # B. 禁用 PLB 特性 (替换 sysctl 读取为 0)
+              sed -i 's/READ_ONCE(net->ipv4.sysctl_tcp_plb_enabled)/0/g' tcp_bbr_main.c
           fi
 
           # 2. 查找并复制 minmax 算法源码
@@ -63,32 +71,39 @@ jobs:
           fi
           cp "$MINMAX_SRC" ./minmax.c
 
-          # 3. 在所有头文件包含完毕后，打桩未导出的 BTF 注册函数
+          # 3. 打桩未导出的 BTF 函数
           sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)\n#define unregister_btf_kfunc_id_set(...) ((void)0)' tcp_bbr_main.c
 
-          # 4. 生成统一适配头文件 (补全 BBRv3 在 GKI 内核缺失的结构体与 BTF 宏)
+          # 4. 生成适配头文件
           cat << 'EOF' > bbr_config.h
           #ifndef _BBR_CONFIG_H
           #define _BBR_CONFIG_H
 
           #include <linux/types.h>
 
-          // 重命名 minmax 符号防止冲突
+          // 重命名 minmax 符号
           #define minmax_running_max bbr_minmax_running_max
           #define minmax_running_min bbr_minmax_running_min
           #define minmax_subwin_update bbr_minmax_subwin_update
 
-          // 补全 BBRv3 PLB 结构体打桩
-          struct tcp_plb_state {
-              u8 dummy;
-          };
+          // 1. PLB 打桩与补丁
+          struct tcp_plb_state { u8 dummy; };
+          #define TCP_PLB_SCALE 8
+          #define tcp_plb_update_state(...) ((void)0)
+          #define tcp_plb_check_rehash(...) ((void)0)
 
-          // 补全 ECN 缺省宏
+          // 2. 缺失的常量与事件打桩
           #ifndef TCP_ECN_LOW
           #define TCP_ECN_LOW 0x04
           #endif
 
-          // 补全 eBPF / BTF kfunc 关键字打桩
+          #ifndef CA_EVENT_TLP_RECOVERY
+          #define CA_EVENT_TLP_RECOVERY 99
+          #endif
+
+          #define tcp_skb_tx_in_flight_is_suspicious(...) (0)
+
+          // 3. eBPF / BTF 声明宏打桩
           #ifndef __bpf_kfunc
           #define __bpf_kfunc
           #endif
@@ -103,7 +118,7 @@ jobs:
           #endif
           EOF
 
-          # 5. 生成 Makefile (加上 net/ipv4 包含路径以解决 tcp_dctcp.h 依赖)
+          # 5. 生成 Makefile
           cat << 'EOF' > Makefile
           obj-m += tcp_bbr.o
           tcp_bbr-y := tcp_bbr_main.o minmax.o
@@ -114,7 +129,7 @@ jobs:
           KDIR=/opt/ddk/kdir/$KMI
           make -C $KDIR M=$WORKDIR modules KMI=$KMI
 
-          # 7. 收集产物并按变体命名导出
+          # 7. 收集产物
           OUT_DIR=/github/workspace/out
           mkdir -p $OUT_DIR
 
