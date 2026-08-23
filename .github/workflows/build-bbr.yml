@@ -27,11 +27,11 @@ jobs:
           - android14-6.1
     container:
       image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}
+      options: --privileged
 
     steps:
       - name: Build tcp_bbr.ko
         run: |
-          set -euo pipefail
           echo "=== Building self-contained tcp_bbr.ko for KMI: ${{ matrix.kmi }} ==="
 
           WORKDIR=/tmp/bbr_build
@@ -40,45 +40,44 @@ jobs:
 
           SRC_BASE=/opt/ddk/src/${{ matrix.kmi }}
 
-          # 1. 复制源码文件
+          # 1. 复制 tcp_bbr.c 源码
           cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
 
+          # 2. 动态查找 minmax 源码
           MINMAX_SRC=$(find $SRC_BASE -type f \( -name "minmax.c" -o -name "win_minmax.c" \) | head -n 1)
-          if [ -z "$MINMAX_SRC" ]; then
+
+          if [ -n "$MINMAX_SRC" ]; then
+              echo "Found minmax source at: $MINMAX_SRC"
+          else
               echo "ERROR: Could not find minmax source file in $SRC_BASE!"
               exit 1
           fi
-          cp "$MINMAX_SRC" ./minmax.c
 
-          # 2. 生成统一的注入头文件 (替代 sed/grep，安全预定义打桩宏与符号重命名)
-          cat << 'EOF' > bbr_config.h
-          #ifndef _BBR_CONFIG_H
-          #define _BBR_CONFIG_H
-
-          // 重命名 minmax 符号以防全局冲突
+          # 3. 在文件最开头注入重命名宏 (必须在 include 头文件之前，确保头文件中的函数声明同步重命名)
+          cat << 'EOF' > header_inject.c
           #define minmax_running_max bbr_minmax_running_max
           #define minmax_running_min bbr_minmax_running_min
           #define minmax_subwin_update bbr_minmax_subwin_update
-
-          // 打桩 GKI 未导出的 BTF / eBPF 注册函数
-          #define register_btf_kfunc_id_set(...) (0)
-          #define unregister_btf_kfunc_id_set(...) ((void)0)
-
-          #endif
           EOF
 
-          # 3. 构造 Makefile (使用 -include 自动注入配置，并采用多文件协同编译)
-          cat << 'EOF' > Makefile
-          obj-m += tcp_bbr.o
-          tcp_bbr-y := tcp_bbr_main.o minmax.o
-          ccflags-y += -include $(src)/bbr_config.h
-          EOF
+          cat header_inject.c ./tcp_bbr_main.c > ./temp_main.c
+          mv ./temp_main.c ./tcp_bbr_main.c
 
-          # 4. 执行内核模块编译
+          # 4. 打桩 GKI 未导出的 BTF/eBPF 注册函数
+          sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)\n#define unregister_btf_kfunc_id_set(...) ((void)0)' tcp_bbr_main.c
+
+          # 5. 将 minmax 算法实现代码追加到文件尾部 (过滤原文件的 #include 与 EXPORT_SYMBOL)
+          grep -v -E "EXPORT_SYMBOL|#include" "$MINMAX_SRC" >> ./tcp_bbr_main.c
+
+          # 6. 生成单文件构建 Makefile
+          echo "obj-m += tcp_bbr.o" > Makefile
+          echo "tcp_bbr-y := tcp_bbr_main.o" >> Makefile
+
+          # 7. 执行编译
           KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
           make -C $KDIR M=$WORKDIR modules
 
-          # 5. 收集产物并 Strip 调试符号
+          # 8. 收集产物并 Strip 调试符号
           OUT_DIR=/github/workspace/out
           mkdir -p $OUT_DIR
           OUTPUT_NAME="${{ matrix.kmi }}_tcp_bbr.ko"
@@ -89,7 +88,7 @@ jobs:
           echo "=== Build succeeded: $OUT_DIR/$OUTPUT_NAME ==="
 
       - name: Upload tcp_bbr.ko artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tcp_bbr-${{ matrix.kmi }}
           path: /github/workspace/out/${{ matrix.kmi }}_tcp_bbr.ko
