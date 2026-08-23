@@ -30,7 +30,7 @@ jobs:
           - android14-6.1
 
     container:
-      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}
+      image: ghcr.io/ylarod/ddk-min/${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}
       options: --privileged
 
     steps:
@@ -127,42 +127,66 @@ jobs:
           cd "${WORKDIR}"
 
           #
-          # tcp_bbr.c 依赖 lib/win_minmax.c 中的实现。
+          # 只在 tcp_bbr.c 的所有头文件处理完之后，
+          # 再屏蔽 register_btf_kfunc_id_set()。
           #
-          # Android GKI 不一定导出 minmax_running_*，
-          # 因此这里把 minmax 实现直接编译进 tcp_bbr.o。
-          #
-          # 通过宏重命名，避免与内核中已有的符号产生冲突。
-          #
-          # 同时屏蔽 BTF kfunc 注册：
-          # Android GKI 场景下我们只需要传统 TCP congestion-control
-          # 功能，不需要 BPF struct_ops 的 BBR kfunc 注册。
+          # 不能在 #include <linux/btf.h> 之前定义这个宏，
+          # 否则 linux/btf.h 自身的函数声明会被宏展开。
           #
 
-          cat > bbr_prefix.h <<'EOF'
+          cp "${TCP_BBR_SRC}" ./tcp_bbr_main.c
+
+          #
+          # 1. 在最开始注入 minmax 符号重命名宏。
+          #
+          # 这些宏必须位于 tcp_bbr.c 的 include 之前，
+          # 因为这样 linux/win_minmax.h 里的声明也会同步重命名。
+          #
+
+          cat > bbr_minmax_prefix.h <<'EOF'
           #define minmax_running_max bbr_minmax_running_max
           #define minmax_running_min bbr_minmax_running_min
           #define minmax_subwin_update bbr_minmax_subwin_update
-
-          #define register_btf_kfunc_id_set(...) (0)
-          #define unregister_btf_kfunc_id_set(...) ((void)0)
           EOF
 
           {
-            cat bbr_prefix.h
+            cat bbr_minmax_prefix.h
+            cat tcp_bbr_main.c
+          } > tcp_bbr_main.tmp
 
+          mv tcp_bbr_main.tmp tcp_bbr_main.c
+
+          #
+          # 2. 在 tcp_bbr.c 的 include 已经处理以后，
+          #    再 stub register_btf_kfunc_id_set()。
+          #
+          #    利用 tcp_bbr.c 中 bbr_register() 的固定结构：
+          #
+          #        static int __init bbr_register(void)
+          #
+          #    在这个函数之前插入宏。
+          #
+
+          if ! grep -qE '^[[:space:]]*static int __init bbr_register\(void\)' tcp_bbr_main.c; then
+            echo "ERROR: Could not locate bbr_register() in tcp_bbr.c"
+            exit 1
+          fi
+
+          sed -i '/^[[:space:]]*static int __init bbr_register(void)/i\
+          #define register_btf_kfunc_id_set(...) (0)\
+          ' tcp_bbr_main.c
+
+          #
+          # 3. 将 win_minmax.c 的实现直接追加到 tcp_bbr_main.c。
+          #
+          # 删除其 include 和 EXPORT_SYMBOL，
+          # 防止再次引入依赖和导出符号。
+          #
+
+          {
             echo
             echo "/* =========================================================="
-            echo " * Original tcp_bbr.c from DDK"
-            echo " * ========================================================== */"
-            echo
-
-            cat "${TCP_BBR_SRC}"
-
-            echo
-            echo "/* =========================================================="
-            echo " * Embedded win_minmax.c implementation"
-            echo " * EXPORT_SYMBOL and #include directives intentionally removed."
+            echo " * Embedded win_minmax.c"
             echo " * ========================================================== */"
             echo
 
@@ -170,12 +194,21 @@ jobs:
               -e '/^[[:space:]]*#include[[:space:]]/d' \
               -e '/EXPORT_SYMBOL/d' \
               "${MINMAX_SRC}"
-          } > tcp_bbr_main.c
+          } >> tcp_bbr_main.c
 
           echo
           echo "Generated source:"
           wc -l tcp_bbr_main.c
           ls -lh tcp_bbr_main.c
+
+          echo
+          echo "=== Checking generated BTF stub ==="
+
+          grep -n \
+            -E \
+            'register_btf_kfunc_id_set|bbr_register' \
+            tcp_bbr_main.c \
+            || true
 
           echo
           echo "=== Generating Makefile ==="
@@ -206,8 +239,8 @@ jobs:
 
           #
           # 保存未 strip 版本。
-          # 调试 kernel panic / module load failure 时非常有用。
           #
+
           UNSTRIPPED="${OUT_DIR}/${KMI}-${DDK_RELEASE}_${MODULE_NAME}-unstripped.ko"
           STRIPPED="${OUT_DIR}/${OUTPUT_NAME}"
 
@@ -220,7 +253,7 @@ jobs:
             llvm-readelf -h "${WORKDIR}/tcp_bbr.ko" \
               | grep -E 'Class|Data|Type|Machine'
           else
-            echo "WARNING: llvm-readelf not found, skipping ELF header check."
+            echo "WARNING: llvm-readelf not found."
           fi
 
           echo
@@ -229,7 +262,7 @@ jobs:
           if command -v modinfo >/dev/null 2>&1; then
             modinfo "${WORKDIR}/tcp_bbr.ko" || true
           else
-            echo "WARNING: modinfo not found in build container."
+            echo "WARNING: modinfo not found."
           fi
 
           echo
@@ -245,14 +278,15 @@ jobs:
               grep -c '.' "${UNDEFINED_SYMBOLS}" || true
             )"
 
+            echo
             echo "Undefined symbol count: ${UNDEFINED_COUNT}"
           else
-            echo "WARNING: llvm-nm not found, skipping undefined symbol check."
+            echo "WARNING: llvm-nm not found."
             echo "WARNING: llvm-nm not available." > "${UNDEFINED_SYMBOLS}"
           fi
 
           echo
-          echo "=== Module dependency check ==="
+          echo "=== Module metadata ==="
 
           MODULE_INFO="${OUT_DIR}/module-info.txt"
 
@@ -264,15 +298,11 @@ jobs:
             echo "Module:"
             basename "${WORKDIR}/tcp_bbr.ko"
             echo
-            echo "Size:"
-            stat -c '%s bytes' "${WORKDIR}/tcp_bbr.ko" || true
-            echo
             echo "SHA256:"
             sha256sum "${WORKDIR}/tcp_bbr.ko"
             echo
-
+            echo "modinfo:"
             if command -v modinfo >/dev/null 2>&1; then
-              echo "modinfo:"
               modinfo "${WORKDIR}/tcp_bbr.ko" || true
             fi
           } | tee "${MODULE_INFO}"
@@ -281,7 +311,7 @@ jobs:
           echo "=== Stripping debug symbols ==="
 
           if ! command -v llvm-strip >/dev/null 2>&1; then
-            echo "ERROR: llvm-strip is not available in the container."
+            echo "ERROR: llvm-strip is not available."
             exit 1
           fi
 
@@ -293,11 +323,14 @@ jobs:
           echo "=== Final module ==="
 
           file "${STRIPPED}" || true
-          ls -lh "${UNSTRIPPED}"
-          ls -lh "${STRIPPED}"
+
+          ls -lh \
+            "${UNSTRIPPED}" \
+            "${STRIPPED}"
 
           echo
           echo "=== SHA256 ==="
+
           sha256sum \
             "${UNSTRIPPED}" \
             "${STRIPPED}"
