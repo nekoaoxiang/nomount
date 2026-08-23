@@ -1,4 +1,4 @@
-name: Build BBR LKM Modules
+name: Build BBR LKM Module
 
 on:
   workflow_dispatch:
@@ -18,52 +18,31 @@ on:
 
 jobs:
   build-bbr:
-    name: Build BBR (${{ matrix.variant }}) for ${{ matrix.kmi }}
+    name: Build tcp_bbr.ko for ${{ matrix.kmi }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         kmi:
           - android14-6.1
-        variant:
-          - v1
-          - v3
     container:
       image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}
 
     steps:
-      - name: Build tcp_bbr module
+      - name: Build tcp_bbr.ko
         run: |
           set -euo pipefail
-          VARIANT="${{ matrix.variant }}"
-          KMI="${{ matrix.kmi }}"
-
-          echo "=== Building self-contained BBR ($VARIANT) for KMI: $KMI ==="
+          echo "=== Building self-contained tcp_bbr.ko for KMI: ${{ matrix.kmi }} ==="
 
           WORKDIR=/tmp/bbr_build
-          rm -rf $WORKDIR
           mkdir -p $WORKDIR
           cd $WORKDIR
 
-          SRC_BASE=/opt/ddk/src/$KMI
+          SRC_BASE=/opt/ddk/src/${{ matrix.kmi }}
 
-          # 1. 获取源码
-          if [ "$VARIANT" = "v1" ]; then
-              cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
-          elif [ "$VARIANT" = "v3" ]; then
-              git clone --depth 1 -b v3 https://github.com/google/bbr.git /tmp/google_bbr
-              cp /tmp/google_bbr/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
+          # 1. 复制源码文件
+          cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
 
-              # --- 对 BBRv3 源码进行 GKI 6.1 适配 ---
-              # A. 将 Google 私有 rate_sample 字段映射回原生 GKI 6.1 结构体字段
-              sed -i 's/rs->lost/rs->losses/g' tcp_bbr_main.c
-              sed -i 's/rs->tx_in_flight/rs->prior_in_flight/g' tcp_bbr_main.c
-
-              # B. 禁用 PLB 特性 (替换 sysctl 读取为 0)
-              sed -i 's/READ_ONCE(net->ipv4.sysctl_tcp_plb_enabled)/0/g' tcp_bbr_main.c
-          fi
-
-          # 2. 查找并复制 minmax 算法源码
           MINMAX_SRC=$(find $SRC_BASE -type f \( -name "minmax.c" -o -name "win_minmax.c" \) | head -n 1)
           if [ -z "$MINMAX_SRC" ]; then
               echo "ERROR: Could not find minmax source file in $SRC_BASE!"
@@ -71,81 +50,46 @@ jobs:
           fi
           cp "$MINMAX_SRC" ./minmax.c
 
-          # 3. 打桩未导出的 BTF 函数
-          sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)\n#define unregister_btf_kfunc_id_set(...) ((void)0)' tcp_bbr_main.c
-
-          # 4. 生成适配头文件
+          # 2. 生成统一的注入头文件 (替代 sed/grep，安全预定义打桩宏与符号重命名)
           cat << 'EOF' > bbr_config.h
           #ifndef _BBR_CONFIG_H
           #define _BBR_CONFIG_H
 
-          #include <linux/types.h>
-
-          // 重命名 minmax 符号
+          // 重命名 minmax 符号以防全局冲突
           #define minmax_running_max bbr_minmax_running_max
           #define minmax_running_min bbr_minmax_running_min
           #define minmax_subwin_update bbr_minmax_subwin_update
 
-          // 1. PLB 打桩与补丁
-          struct tcp_plb_state { u8 dummy; };
-          #define TCP_PLB_SCALE 8
-          #define tcp_plb_update_state(...) ((void)0)
-          #define tcp_plb_check_rehash(...) ((void)0)
-
-          // 2. 缺失的常量与事件打桩
-          #ifndef TCP_ECN_LOW
-          #define TCP_ECN_LOW 0x04
-          #endif
-
-          #ifndef CA_EVENT_TLP_RECOVERY
-          #define CA_EVENT_TLP_RECOVERY 99
-          #endif
-
-          #define tcp_skb_tx_in_flight_is_suspicious(...) (0)
-
-          // 3. eBPF / BTF 声明宏打桩
-          #ifndef __bpf_kfunc
-          #define __bpf_kfunc
-          #endif
-
-          #undef BTF_KFUNCS_START
-          #define BTF_KFUNCS_START(name) static int name;
-          #undef BTF_KFUNCS_END
-          #define BTF_KFUNCS_END(name)
-          #undef BTF_KFUNC_DECL
-          #define BTF_KFUNC_DECL(name)
+          // 打桩 GKI 未导出的 BTF / eBPF 注册函数
+          #define register_btf_kfunc_id_set(...) (0)
+          #define unregister_btf_kfunc_id_set(...) ((void)0)
 
           #endif
           EOF
 
-          # 5. 生成 Makefile
+          # 3. 构造 Makefile (使用 -include 自动注入配置，并采用多文件协同编译)
           cat << 'EOF' > Makefile
           obj-m += tcp_bbr.o
           tcp_bbr-y := tcp_bbr_main.o minmax.o
-          ccflags-y += -include $(src)/bbr_config.h -I/opt/ddk/src/$(KMI)/net/ipv4
+          ccflags-y += -include $(src)/bbr_config.h
           EOF
 
-          # 6. 执行编译
-          KDIR=/opt/ddk/kdir/$KMI
-          make -C $KDIR M=$WORKDIR modules KMI=$KMI
+          # 4. 执行内核模块编译
+          KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
+          make -C $KDIR M=$WORKDIR modules
 
-          # 7. 收集产物
+          # 5. 收集产物并 Strip 调试符号
           OUT_DIR=/github/workspace/out
           mkdir -p $OUT_DIR
-
-          if [ "$VARIANT" = "v1" ]; then
-              OUTPUT_NAME="${KMI}_tcp_bbr.ko"
-          else
-              OUTPUT_NAME="${KMI}_tcp_bbr_v3.ko"
-          fi
+          OUTPUT_NAME="${{ matrix.kmi }}_tcp_bbr.ko"
 
           cp tcp_bbr.ko "$OUT_DIR/$OUTPUT_NAME"
           llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
 
-          echo "=== Successfully built $VARIANT -> $OUT_DIR/$OUTPUT_NAME ==="
+          echo "=== Build succeeded: $OUT_DIR/$OUTPUT_NAME ==="
 
-      - name: Upload artifact
+      - name: Upload tcp_bbr.ko artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tcp_bbr-${{ matrix.variant }}-${{ matrix.kmi }}
-          path: /github/workspace/out/*.ko
+          name: tcp_bbr-${{ matrix.kmi }}
+          path: /github/workspace/out/${{ matrix.kmi }}_tcp_bbr.ko
