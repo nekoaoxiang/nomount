@@ -47,7 +47,7 @@ jobs:
 
           SRC_BASE=/opt/ddk/src/$KMI
 
-          # 1. 根据变体分支选择源码来源 (均保留代码内部 .name = "bbr")
+          # 1. 根据变体获取源码
           if [ "$VARIANT" = "v1" ]; then
               cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
           elif [ "$VARIANT" = "v3" ]; then
@@ -63,7 +63,10 @@ jobs:
           fi
           cp "$MINMAX_SRC" ./minmax.c
 
-          # 3. 注入头文件 (重命名 minmax 符号 + 打桩 GKI 未导出的 BTF 函数)
+          # 3. 在所有头文件加载完毕后打桩 BTF 函数 (防止破坏 <linux/btf.h> 中的函数声明)
+          sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)\n#define unregister_btf_kfunc_id_set(...) ((void)0)' tcp_bbr_main.c
+
+          # 4. 生成安全配置头文件 (仅包含安全的标识符重命名)
           cat << 'EOF' > bbr_config.h
           #ifndef _BBR_CONFIG_H
           #define _BBR_CONFIG_H
@@ -72,24 +75,21 @@ jobs:
           #define minmax_running_min bbr_minmax_running_min
           #define minmax_subwin_update bbr_minmax_subwin_update
 
-          #define register_btf_kfunc_id_set(...) (0)
-          #define unregister_btf_kfunc_id_set(...) ((void)0)
-
           #endif
           EOF
 
-          # 4. 生成统一 Makefile (内部模块名始终保持为 tcp_bbr)
+          # 5. 生成 Makefile (添加 net/ipv4 路径以防 tcp_dctcp.h 缺失)
           cat << 'EOF' > Makefile
           obj-m += tcp_bbr.o
           tcp_bbr-y := tcp_bbr_main.o minmax.o
-          ccflags-y += -include $(src)/bbr_config.h
+          ccflags-y += -include $(src)/bbr_config.h -I/opt/ddk/src/$(KMI)/net/ipv4
           EOF
 
-          # 5. 执行编译
+          # 6. 执行内核模块编译
           KDIR=/opt/ddk/kdir/$KMI
-          make -C $KDIR M=$WORKDIR modules
+          make -C $KDIR M=$WORKDIR modules KMI=$KMI
 
-          # 6. 收集产物并通过文件名区分 v1 与 v3
+          # 7. 收集产物并按变体命名
           OUT_DIR=/github/workspace/out
           mkdir -p $OUT_DIR
 
