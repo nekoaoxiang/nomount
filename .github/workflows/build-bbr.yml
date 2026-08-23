@@ -4,91 +4,325 @@ on:
   workflow_dispatch:
     inputs:
       ddk_release:
-        description: 'DDK release version'
+        description: "DDK release version"
         required: false
-        default: '20260313'
+        default: "20260313"
         type: string
+
   workflow_call:
     inputs:
       ddk_release:
-        description: 'DDK release version'
+        description: "DDK release version"
         required: false
-        default: '20260313'
+        default: "20260313"
         type: string
 
 jobs:
   build-bbr:
     name: Build tcp_bbr.ko for ${{ matrix.kmi }}
+
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         kmi:
           - android14-6.1
+
     container:
       image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}
       options: --privileged
 
     steps:
       - name: Build tcp_bbr.ko
+        shell: bash
         run: |
-          echo "=== Building self-contained tcp_bbr.ko for KMI: ${{ matrix.kmi }} ==="
+          set -Eeuo pipefail
 
-          WORKDIR=/tmp/bbr_build
-          mkdir -p $WORKDIR
-          cd $WORKDIR
+          echo "============================================================"
+          echo "Building self-contained tcp_bbr.ko"
+          echo "KMI         : ${{ matrix.kmi }}"
+          echo "DDK release : ${{ inputs.ddk_release || '20260313' }}"
+          echo "============================================================"
 
-          SRC_BASE=/opt/ddk/src/${{ matrix.kmi }}
+          KMI="${{ matrix.kmi }}"
+          DDK_RELEASE="${{ inputs.ddk_release || '20260313' }}"
 
-          # 1. 复制 tcp_bbr.c 源码
-          cp $SRC_BASE/net/ipv4/tcp_bbr.c ./tcp_bbr_main.c
+          WORKDIR="/tmp/bbr_build"
+          SRC_BASE="/opt/ddk/src/${KMI}"
+          KDIR="/opt/ddk/kdir/${KMI}"
+          OUT_DIR="/github/workspace/out"
 
-          # 2. 动态查找 minmax 源码
-          MINMAX_SRC=$(find $SRC_BASE -type f \( -name "minmax.c" -o -name "win_minmax.c" \) | head -n 1)
+          TCP_BBR_SRC="${SRC_BASE}/net/ipv4/tcp_bbr.c"
+          MINMAX_SRC="${SRC_BASE}/lib/win_minmax.c"
 
-          if [ -n "$MINMAX_SRC" ]; then
-              echo "Found minmax source at: $MINMAX_SRC"
-          else
-              echo "ERROR: Could not find minmax source file in $SRC_BASE!"
-              exit 1
+          MODULE_NAME="tcp_bbr"
+          OUTPUT_NAME="${KMI}-${DDK_RELEASE}_${MODULE_NAME}.ko"
+
+          rm -rf "${WORKDIR}"
+          mkdir -p "${WORKDIR}"
+          mkdir -p "${OUT_DIR}"
+
+          echo
+          echo "=== Environment ==="
+          echo "WORKDIR      : ${WORKDIR}"
+          echo "SRC_BASE     : ${SRC_BASE}"
+          echo "KDIR         : ${KDIR}"
+          echo "TCP_BBR_SRC  : ${TCP_BBR_SRC}"
+          echo "MINMAX_SRC   : ${MINMAX_SRC}"
+          echo "OUTPUT_NAME  : ${OUTPUT_NAME}"
+
+          echo
+          echo "=== Verifying DDK source tree ==="
+
+          if [[ ! -d "${SRC_BASE}" ]]; then
+            echo "ERROR: DDK source directory does not exist:"
+            echo "       ${SRC_BASE}"
+            exit 1
           fi
 
-          # 3. 在文件最开头注入重命名宏 (必须在 include 头文件之前，确保头文件中的函数声明同步重命名)
-          cat << 'EOF' > header_inject.c
+          if [[ ! -d "${KDIR}" ]]; then
+            echo "ERROR: Kernel build directory does not exist:"
+            echo "       ${KDIR}"
+            exit 1
+          fi
+
+          if [[ ! -f "${TCP_BBR_SRC}" ]]; then
+            echo "ERROR: tcp_bbr.c not found:"
+            echo "       ${TCP_BBR_SRC}"
+            exit 1
+          fi
+
+          if [[ ! -f "${MINMAX_SRC}" ]]; then
+            echo "ERROR: win_minmax.c not found:"
+            echo "       ${MINMAX_SRC}"
+            exit 1
+          fi
+
+          echo "Found tcp_bbr.c:"
+          ls -l "${TCP_BBR_SRC}"
+
+          echo "Found win_minmax.c:"
+          ls -l "${MINMAX_SRC}"
+
+          echo
+          echo "=== Kernel information ==="
+
+          KERNEL_RELEASE="unknown"
+
+          if [[ -f "${KDIR}/include/config/kernel.release" ]]; then
+            KERNEL_RELEASE="$(cat "${KDIR}/include/config/kernel.release")"
+          elif [[ -f "${KDIR}/include/generated/utsrelease.h" ]]; then
+            KERNEL_RELEASE="$(
+              sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' \
+                "${KDIR}/include/generated/utsrelease.h"
+            )"
+          fi
+
+          echo "Kernel release: ${KERNEL_RELEASE}"
+
+          echo
+          echo "=== Preparing self-contained source ==="
+
+          cd "${WORKDIR}"
+
+          #
+          # tcp_bbr.c 依赖 lib/win_minmax.c 中的实现。
+          #
+          # Android GKI 不一定导出 minmax_running_*，
+          # 因此这里把 minmax 实现直接编译进 tcp_bbr.o。
+          #
+          # 通过宏重命名，避免与内核中已有的符号产生冲突。
+          #
+          # 同时屏蔽 BTF kfunc 注册：
+          # Android GKI 场景下我们只需要传统 TCP congestion-control
+          # 功能，不需要 BPF struct_ops 的 BBR kfunc 注册。
+          #
+
+          cat > bbr_prefix.h <<'EOF'
           #define minmax_running_max bbr_minmax_running_max
           #define minmax_running_min bbr_minmax_running_min
           #define minmax_subwin_update bbr_minmax_subwin_update
+
+          #define register_btf_kfunc_id_set(...) (0)
+          #define unregister_btf_kfunc_id_set(...) ((void)0)
           EOF
 
-          cat header_inject.c ./tcp_bbr_main.c > ./temp_main.c
-          mv ./temp_main.c ./tcp_bbr_main.c
+          {
+            cat bbr_prefix.h
 
-          # 4. 打桩 GKI 未导出的 BTF/eBPF 注册函数
-          sed -i '/static int __init/i #define register_btf_kfunc_id_set(...) (0)\n#define unregister_btf_kfunc_id_set(...) ((void)0)' tcp_bbr_main.c
+            echo
+            echo "/* =========================================================="
+            echo " * Original tcp_bbr.c from DDK"
+            echo " * ========================================================== */"
+            echo
 
-          # 5. 将 minmax 算法实现代码追加到文件尾部 (过滤原文件的 #include 与 EXPORT_SYMBOL)
-          grep -v -E "EXPORT_SYMBOL|#include" "$MINMAX_SRC" >> ./tcp_bbr_main.c
+            cat "${TCP_BBR_SRC}"
 
-          # 6. 生成单文件构建 Makefile
-          echo "obj-m += tcp_bbr.o" > Makefile
-          echo "tcp_bbr-y := tcp_bbr_main.o" >> Makefile
+            echo
+            echo "/* =========================================================="
+            echo " * Embedded win_minmax.c implementation"
+            echo " * EXPORT_SYMBOL and #include directives intentionally removed."
+            echo " * ========================================================== */"
+            echo
 
-          # 7. 执行编译
-          KDIR=/opt/ddk/kdir/${{ matrix.kmi }}
-          make -C $KDIR M=$WORKDIR modules
+            sed \
+              -e '/^[[:space:]]*#include[[:space:]]/d' \
+              -e '/EXPORT_SYMBOL/d' \
+              "${MINMAX_SRC}"
+          } > tcp_bbr_main.c
 
-          # 8. 收集产物并 Strip 调试符号
-          OUT_DIR=/github/workspace/out
-          mkdir -p $OUT_DIR
-          OUTPUT_NAME="${{ matrix.kmi }}_tcp_bbr.ko"
+          echo
+          echo "Generated source:"
+          wc -l tcp_bbr_main.c
+          ls -lh tcp_bbr_main.c
 
-          cp tcp_bbr.ko "$OUT_DIR/$OUTPUT_NAME"
-          llvm-strip -d "$OUT_DIR/$OUTPUT_NAME"
+          echo
+          echo "=== Generating Makefile ==="
 
-          echo "=== Build succeeded: $OUT_DIR/$OUTPUT_NAME ==="
+          cat > Makefile <<'EOF'
+          obj-m += tcp_bbr.o
+          tcp_bbr-y := tcp_bbr_main.o
+          EOF
+
+          cat Makefile
+
+          echo
+          echo "=== Building module ==="
+
+          make \
+            -C "${KDIR}" \
+            M="${WORKDIR}" \
+            modules
+
+          if [[ ! -f "${WORKDIR}/tcp_bbr.ko" ]]; then
+            echo "ERROR: tcp_bbr.ko was not generated."
+            exit 1
+          fi
+
+          echo
+          echo "=== Raw module generated successfully ==="
+          ls -lh "${WORKDIR}/tcp_bbr.ko"
+
+          #
+          # 保存未 strip 版本。
+          # 调试 kernel panic / module load failure 时非常有用。
+          #
+          UNSTRIPPED="${OUT_DIR}/${KMI}-${DDK_RELEASE}_${MODULE_NAME}-unstripped.ko"
+          STRIPPED="${OUT_DIR}/${OUTPUT_NAME}"
+
+          cp "${WORKDIR}/tcp_bbr.ko" "${UNSTRIPPED}"
+
+          echo
+          echo "=== ELF verification ==="
+
+          if command -v llvm-readelf >/dev/null 2>&1; then
+            llvm-readelf -h "${WORKDIR}/tcp_bbr.ko" \
+              | grep -E 'Class|Data|Type|Machine'
+          else
+            echo "WARNING: llvm-readelf not found, skipping ELF header check."
+          fi
+
+          echo
+          echo "=== Module information ==="
+
+          if command -v modinfo >/dev/null 2>&1; then
+            modinfo "${WORKDIR}/tcp_bbr.ko" || true
+          else
+            echo "WARNING: modinfo not found in build container."
+          fi
+
+          echo
+          echo "=== Undefined symbol check ==="
+
+          UNDEFINED_SYMBOLS="${OUT_DIR}/undefined-symbols.txt"
+
+          if command -v llvm-nm >/dev/null 2>&1; then
+            llvm-nm -u "${WORKDIR}/tcp_bbr.ko" \
+              | tee "${UNDEFINED_SYMBOLS}"
+
+            UNDEFINED_COUNT="$(
+              grep -c '.' "${UNDEFINED_SYMBOLS}" || true
+            )"
+
+            echo "Undefined symbol count: ${UNDEFINED_COUNT}"
+          else
+            echo "WARNING: llvm-nm not found, skipping undefined symbol check."
+            echo "WARNING: llvm-nm not available." > "${UNDEFINED_SYMBOLS}"
+          fi
+
+          echo
+          echo "=== Module dependency check ==="
+
+          MODULE_INFO="${OUT_DIR}/module-info.txt"
+
+          {
+            echo "KMI=${KMI}"
+            echo "DDK_RELEASE=${DDK_RELEASE}"
+            echo "KERNEL_RELEASE=${KERNEL_RELEASE}"
+            echo
+            echo "Module:"
+            basename "${WORKDIR}/tcp_bbr.ko"
+            echo
+            echo "Size:"
+            stat -c '%s bytes' "${WORKDIR}/tcp_bbr.ko" || true
+            echo
+            echo "SHA256:"
+            sha256sum "${WORKDIR}/tcp_bbr.ko"
+            echo
+
+            if command -v modinfo >/dev/null 2>&1; then
+              echo "modinfo:"
+              modinfo "${WORKDIR}/tcp_bbr.ko" || true
+            fi
+          } | tee "${MODULE_INFO}"
+
+          echo
+          echo "=== Stripping debug symbols ==="
+
+          if ! command -v llvm-strip >/dev/null 2>&1; then
+            echo "ERROR: llvm-strip is not available in the container."
+            exit 1
+          fi
+
+          cp "${WORKDIR}/tcp_bbr.ko" "${STRIPPED}"
+
+          llvm-strip -d "${STRIPPED}"
+
+          echo
+          echo "=== Final module ==="
+
+          file "${STRIPPED}" || true
+          ls -lh "${UNSTRIPPED}"
+          ls -lh "${STRIPPED}"
+
+          echo
+          echo "=== SHA256 ==="
+          sha256sum \
+            "${UNSTRIPPED}" \
+            "${STRIPPED}"
+
+          echo
+          echo "============================================================"
+          echo "Build succeeded"
+          echo "KMI         : ${KMI}"
+          echo "DDK release : ${DDK_RELEASE}"
+          echo "Kernel      : ${KERNEL_RELEASE}"
+          echo "Module      : ${STRIPPED}"
+          echo "============================================================"
 
       - name: Upload tcp_bbr.ko artifact
         uses: actions/upload-artifact@v7
         with:
-          name: tcp_bbr-${{ matrix.kmi }}
-          path: /github/workspace/out/${{ matrix.kmi }}_tcp_bbr.ko
+          name: tcp_bbr-${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}
+          path: |
+            /github/workspace/out/${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}_tcp_bbr.ko
+            /github/workspace/out/undefined-symbols.txt
+            /github/workspace/out/module-info.txt
+
+      - name: Upload unstripped debug module
+        uses: actions/upload-artifact@v7
+        with:
+          name: tcp_bbr-debug-${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}
+          path: |
+            /github/workspace/out/${{ matrix.kmi }}-${{ inputs.ddk_release || '20260313' }}_tcp_bbr-unstripped.ko
